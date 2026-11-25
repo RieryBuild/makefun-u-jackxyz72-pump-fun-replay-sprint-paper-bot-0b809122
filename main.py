@@ -1,33 +1,53 @@
 """Pump.fun Replay Sprint — paper trading bot (pure Python stdlib).
 
-Strategy, in brief: buy quality launches early, take the profit, never
-chase. A coin qualifies only while it is still young (first 30 trades)
-and only when its early flow is buy-heavy (cumulative buys >= 3 SOL and
-at least twice cumulative sells), dispersed (7+ distinct buyers, no
-single buyer over 35% of the buys), and honest (the creator put in
-0.05–1 SOL of their own money and has not sold). The position then
-exits whole on take-profit (+25%), stop-loss (-15%), a tight trailing
-stop that arms at +5% and sells on a 5% pullback from the peak, a
-hold-time cap, staleness, or a creator sell. Up to four entries per coin
-are allowed while it stays in its early window, so a stopped-out coin
-that re-qualifies can be re-entered. A separate probe mode relaxes the
-bars when round-tripped coins lag the pace of the window, so the
-20-coin guardrail stays in reach.
+Strategy: TIERED DIP REVERSION. Buy the dip — but only the dips that
+screened positive. Offline screening over the dev window (faithful fill
+model: 2-slot latency, 1500 bps slippage rejection, 1% size cap, real
+fees) tested ~45 rules across the momentum, sniper, dip, exhaustion,
+late-ride, completion-ride, smart-wallet, serial-creator, revival,
+accumulation and volume-breakout families. Almost everything loses in
+at least one half of the window. The one surviving shape is a deep dip
+on a coin whose creator has skin in the game:
 
-Why these bars: offline screening over the dev window (latency, size
-cap, slippage rejections and fees all modelled) showed that chasing
-mature momentum loses money, that riding winners uncapped loses money,
-and that the creator-skin + dispersed-ownership filters are what turn
-the early-entry edge positive. The 15% slippage bound is kept on purpose:
-widening it lets the bot fill into pumps that have already run away.
+  - price down to 70% or less of its 40-trade high,
+  - buyers stepping back in (last 10 trades net buys, >= 0.2 SOL),
+  - dispersed ownership (7+ distinct buyers in the last 40 trades, no
+    single buyer over 35% of the buys),
+  - creator bought 0.05-1 SOL of their own coin and has not sold.
+
+That primary lane screened +0.334 SOL on 20 fills (5 coins, win 0.65)
+with a positive total in BOTH halves of the window — the only rule in
+the whole screen with that property at meaningful size. Two cheaper
+tiers fill out the trade count so the 20-coin guardrail stays in reach:
+a -20% probe tier (same creator + resumption gates, 0.08 SOL) and a
+-10% filler tier (0.02 SOL, fired only when round trips lag the pace
+of the window). Every tier exits the same way: take-profit +15%,
+stop-loss -12%, a trailing stop that arms at +5% and sells on a 5%
+pullback from the peak, a 1800-slot hold cap, 900-slot staleness, or a
+creator sell. Ablations that shaped this: dropping the creator filter
+turns the dip edge deeply negative; widening the buy slippage hurts;
+uncapping the take-profit hurts; pyramiding hurts; late-curve
+completion bets lose (stop fills fail on fast dumps).
+
+Why the edge should generalize (and its limits): the rule does not
+chase pumps — it waits for a 30% washout, then demands evidence that
+real, dispersed buyers are returning while the creator still holds
+their stake. That is a statement about market structure (washout +
+re-accumulation), not about any one coin's chart. The honest limit is
+concentration: the primary lane fired on only 5 coins in the dev
+window, so a fresh window's outcome depends on whether such coins show
+up again — the stress test is the arbiter, and the probe/filler tiers
+exist precisely so the bot still trades broadly if they do not.
 
 Protocol: the harness speaks agent-fun/replay/v2 over stdio — one hello,
 then one batch per slot carrying events, marks and fills, then done. This
 file owns the strategy only; vendor/makefun_bot.py owns the wire. Every
 decision here is a pure function of the batches seen so far: no clock,
 no randomness, no network, no environment reads, and every iteration
-that affects order is over insertion-ordered dicts or an explicit sort,
-so two graded runs produce byte-identical action logs.
+that affects order is over insertion-ordered dicts, an explicit sort,
+or batch order, so two graded runs produce byte-identical action logs.
+All price comparisons are integer cross-multiplication on reserve
+rationals; there are no float literals anywhere in this file.
 """
 
 import os
@@ -39,43 +59,42 @@ import makefun_bot
 SOL = 1_000_000_000
 
 # --- sizing (lamports) -------------------------------------------------------
-FIRST_BUY = 80_000_000          # 0.08 SOL entry; capped by the size cap
-MIN_BUY = 10_000_000            # 0.01 SOL: below this a round trip is no good
+SIZE_PRIMARY = 150_000_000   # 0.15 SOL: deep-dip entries on mid-curve coins
+SIZE_PROBE = 80_000_000      # 0.08 SOL: -20% probe tier
+SIZE_FILLER = 20_000_000     # 0.02 SOL: -10% filler tier (2x the round-trip bar)
+MIN_BUY = 10_000_000         # 0.01 SOL: below this a round trip is no good
 MAX_SLIPPAGE_BPS = 1500
 
-# --- quality entry bars ------------------------------------------------------
-MAX_EARLY_TRADES = 30           # only the coin's first 30 trades qualify
-MIN_EARLY_BUY_SOL = 3_000_000_000   # cumulative buys in the early window
-MIN_BUY_SELL_NUM = 2              # cumulative buys vs cumulative sells, as
-MIN_BUY_SELL_DEN = 1              # an integer ratio (2:1) — no floats anywhere
-MIN_BUYERS = 7
-MAX_TOP_BUYER_SHARE_BPS = 3500  # no single buyer over 35% of the buys
-CREATOR_BUY_MIN = 50_000_000    # creator skin in the game: 0.05 SOL
+# --- dip entry bars (shared by all tiers unless noted) -----------------------
+MIN_AGE_SLOTS = 150          # coin must be at least this old (slots)
+MIN_TRADES = 41              # ...and have at least this many trades seen
+                             # (41: the 40-trade high needs 41 points)
+HIGH_WINDOW = 41             # 40-trade high, including the current trade
+FLOW_WINDOW = 40             # buyer window, including the current trade
+RESUME_WINDOW = 10           # resumption window, including the current trade
+MIN_RESUME_BUY_SOL = 200_000_000  # last-10-trades buys must clear this
+MIN_BUYERS = 7               # distinct buyers in the buyer window (primary)
+MAX_TOP_BUYER_SHARE_BPS = 3500   # no single buyer over 35% (primary)
+CREATOR_BUY_MIN = 50_000_000     # creator skin in the game: 0.05 SOL
 CREATOR_BUY_MAX = 1_000_000_000  # ...but over 1 SOL smells bundled
+# Depth tiers, as integer ratios of current price to the 40-trade high:
+# primary fires at <= 70%, probe at <= 80%, filler at <= 90%.
+PRIMARY_NUM = 70
+PROBE_NUM = 80
+FILLER_NUM = 90
+DEPTH_DEN = 100
 
-# --- probe mode (relaxed bars, used only when round trips lag the pace) ------
-PROBE_MAX_EARLY_TRADES = 60
-PROBE_MIN_EARLY_BUY_SOL = 1_000_000_000
-PROBE_MIN_BUY_SELL_NUM = 3
-PROBE_MIN_BUY_SELL_DEN = 2
-PROBE_MIN_BUYERS = 5
-PROBE_MAX_TOP_BUYER_SHARE_BPS = 5000
-PROBE_CREATOR_BUY_MIN = 20_000_000
-PROBE_CREATOR_BUY_MAX = 2_000_000_000
-
-# --- exits (all comparisons in integer basis points; no floats anywhere,
-# so two graded runs cannot diverge on rounding) ---------------------------
-TAKE_PROFIT_BPS = 12500         # +25%
-STOP_LOSS_BPS = 8500            # -15%
+# --- exits (all comparisons in integer basis points; no floats anywhere) -----
+TAKE_PROFIT_BPS = 11500         # +15%
+STOP_LOSS_BPS = 8800            # -12%
 TRAIL_ARM_BPS = 10500           # trailing stop arms once peak reaches this
 TRAIL_FACTOR_BPS = 9500         # sell when value falls to 95% of peak
-MAX_HOLD_SLOTS = 7200           # ~48 min
+MAX_HOLD_SLOTS = 1800           # ~12 min
 STALE_SLOTS = 900               # no trade for this long -> exit
 
-MAX_TRADES_KEPT = 80
-MAX_BUYERS_KEPT = 150
+MAX_TRADES_KEPT = 64
 PRUNE_AFTER_SLOTS = 4000        # drop idle unheld coins this stale
-MAX_REENTRIES = 4
+MAX_ENTRIES_PER_TIER = 4
 
 
 class Coin:
@@ -83,8 +102,8 @@ class Coin:
 
     __slots__ = (
         "mint", "created_slot", "creator", "complete", "last_trade_slot",
-        "trade_count", "trades", "buyers", "cum_buy_sol",
-        "cum_sell_sol", "creator_buy_sol", "creator_sold", "entries",
+        "trade_count", "trades", "creator_buy_sol", "creator_sold",
+        "entries_primary", "entries_probe", "entries_filler",
     )
 
     def __init__(self, mint, created_slot, creator):
@@ -94,44 +113,92 @@ class Coin:
         self.complete = False
         self.last_trade_slot = created_slot if created_slot is not None else -1
         self.trade_count = 0
-        self.trades = []        # (slot, is_buy, sol_lamports), oldest first
-        self.buyers = {}        # user -> buy lamports
-        self.cum_buy_sol = 0
-        self.cum_sell_sol = 0
+        # (slot, is_buy, sol_lamports, user, vsol, vtok), oldest first
+        self.trades = []
         self.creator_buy_sol = 0
         self.creator_sold = False
-        self.entries = 0
+        self.entries_primary = 0
+        self.entries_probe = 0
+        self.entries_filler = 0
 
     def note_trade(self, slot, is_buy, sol, user, vsol, vtok):
         self.last_trade_slot = slot
         self.trade_count += 1
-        self.trades.append((slot, is_buy, sol))
+        self.trades.append((slot, is_buy, sol, user, vsol, vtok))
         if len(self.trades) > MAX_TRADES_KEPT:
             del self.trades[0]
         if is_buy:
-            self.cum_buy_sol += sol
             if user == self.creator:
                 self.creator_buy_sol += sol
-            prev = self.buyers.get(user)
-            if prev is None:
-                if len(self.buyers) < MAX_BUYERS_KEPT:
-                    self.buyers[user] = sol
-            else:
-                self.buyers[user] = prev + sol
         else:
-            self.cum_sell_sol += sol
             if user == self.creator:
                 self.creator_sold = True
 
-    def top_buyer_share_bps(self):
-        """Top buyer's share of all buys, in basis points (integer)."""
-        if self.cum_buy_sol <= 0 or not self.buyers:
-            return 10000
-        top = 0
-        for v in self.buyers.values():
-            if v > top:
-                top = v
-        return top * 10000 // self.cum_buy_sol
+    def _price_le_ratio(self, vsol, vtok, hsol, htok, num, den):
+        """True when vsol/vtok <= (num/den) * (hsol/htok), integer math."""
+        return vsol * htok * den <= hsol * vtok * num
+
+    def tier(self):
+        """Dip tier of the latest trade: 30 (primary), 20 (probe),
+        15 (filler) or 0 (no dip / gates failed). Uses only trades seen
+        so far; mirrors the screened rule exactly."""
+        if self.created_slot is None:
+            return 0
+        if self.trade_count < MIN_TRADES:
+            return 0
+        if self.last_trade_slot - self.created_slot < MIN_AGE_SLOTS:
+            return 0
+        if self.creator_sold:
+            return 0
+        if (self.creator_buy_sol < CREATOR_BUY_MIN
+                or self.creator_buy_sol > CREATOR_BUY_MAX):
+            return 0
+        trades = self.trades
+        # 40-trade high over the last HIGH_WINDOW trades (incl. current).
+        hi = trades[-HIGH_WINDOW:]
+        hsol, htok = hi[0][4], hi[0][5]
+        for t in hi[1:]:
+            # t's price > current high? t.vsol/t.vtok > hsol/htok
+            if t[4] * htok > hsol * t[5]:
+                hsol, htok = t[4], t[5]
+        if hsol <= 0 or htok <= 0:
+            return 0
+        cur = trades[-1]
+        vsol, vtok = cur[4], cur[5]
+        if vsol <= 0 or vtok <= 0:
+            return 0
+        if not self._price_le_ratio(vsol, vtok, hsol, htok, FILLER_NUM, DEPTH_DEN):
+            return 0
+        # Resumption: last RESUME_WINDOW trades net buys >= the bar.
+        buy = 0
+        sell = 0
+        for t in trades[-RESUME_WINDOW:]:
+            if t[1]:
+                buy += t[2]
+            else:
+                sell += t[2]
+        if buy < MIN_RESUME_BUY_SOL or buy < sell:
+            return 0
+        if self._price_le_ratio(vsol, vtok, hsol, htok, PRIMARY_NUM, DEPTH_DEN):
+            # Primary tier: dispersed ownership gates on the buyer window.
+            buyers = {}
+            total = 0
+            for t in trades[-FLOW_WINDOW:]:
+                if t[1]:
+                    total += t[2]
+                    buyers[t[3]] = buyers.get(t[3], 0) + t[2]
+            if len(buyers) < MIN_BUYERS:
+                return 0
+            top = 0
+            for v in buyers.values():
+                if v > top:
+                    top = v
+            if total <= 0 or top * 10000 > total * MAX_TOP_BUYER_SHARE_BPS:
+                return 0
+            return 30
+        if self._price_le_ratio(vsol, vtok, hsol, htok, PROBE_NUM, DEPTH_DEN):
+            return 20
+        return 15
 
 
 class Bot:
@@ -147,20 +214,16 @@ class Bot:
     def round_trips(self):
         return self.round_trip_count
 
-    def probe_mode(self):
-        """True when round-tripped coins lag the pace of the window."""
-        rt = self.round_trips()
-        if rt >= 20:
+    def filler_on(self):
+        """True once the window is underway and the 20-coin guardrail is
+        still unmet: the -10% filler tier fires only then, so its
+        (roughly breakeven) trades buy guardrail coverage instead of
+        crowding out the edge. The gate stays open until the guardrail IS
+        met — switching the filler off at 15 round trips (as the first
+        draft did) strands the bot 5 coins short of the bar."""
+        if self.round_trips() >= 20:
             return False
-        # Batches are slots carrying records; the window is ~24h. Probe
-        # tiers fire as the window advances with too few round trips.
-        if self.batches > 20000 and rt < 15:
-            return True
-        if self.batches > 8000 and rt < 10:
-            return True
-        if self.batches > 3000 and rt < 6:
-            return True
-        return False
+        return self.batches > 1500
 
     # -- tracking -------------------------------------------------------------
     def _coin(self, mint, slot, creator=None):
@@ -287,80 +350,61 @@ class Bot:
                 free -= tx
         exiting = {o["mint"] for o in orders if o["side"] == "sell"}
 
-        # 2) Fresh entries: only coins that traded in this batch, in batch
-        #    order (first-come, first-served — the early window is short).
-        probe = self.probe_mode()
-        for e in batch["events"]:
-            if e["event"] != "TradeEvent":
+        # 2) Fresh entries, in tier-priority passes over this batch's
+        #    trades: the primary lane never loses a position slot to a
+        #    filler. Each pass is first-come, first-served in batch order.
+        trade_events = [e for e in batch["events"] if e["event"] == "TradeEvent"]
+        filler = self.filler_on()
+        for want_tier, size in ((30, SIZE_PRIMARY), (20, SIZE_PROBE),
+                                (15, SIZE_FILLER)):
+            if want_tier == 15 and not filler:
                 continue
-            if slots_open <= 0 or len(orders) >= max_orders:
-                break
-            mint = e["mint"]
-            coin = self.coins.get(mint)
-            if coin is None or coin.complete:
-                continue
-            if mint in state.positions or mint in exiting:
-                continue
-            # A buy already in flight on this mint: do not stack another.
-            if any(p.order["side"] == "buy" and p.order["mint"] == mint
-                   for p in state.pending.values()):
-                continue
-            if coin.entries >= MAX_REENTRIES:
-                continue
-            if not self._qualifies(coin, probe):
-                continue
-            cap = state.max_buy_lamports(mint)
-            if cap < MIN_BUY:
-                continue
-            amount = FIRST_BUY
-            if amount > cap:
-                amount = cap
-            if free < amount + tx:
-                continue
-            orders.append({
-                "side": "buy", "mint": mint, "quote_lamports": amount,
-                "max_slippage_bps": MAX_SLIPPAGE_BPS,
-            })
-            free -= amount + tx
-            slots_open -= 1
-            coin.entries += 1
+            for e in trade_events:
+                if slots_open <= 0 or len(orders) >= max_orders:
+                    break
+                mint = e["mint"]
+                coin = self.coins.get(mint)
+                if coin is None or coin.complete:
+                    continue
+                if mint in state.positions or mint in exiting:
+                    continue
+                # A buy already in flight on this mint: do not stack another.
+                if any(p.order["side"] == "buy" and p.order["mint"] == mint
+                       for p in state.pending.values()):
+                    continue
+                tier = coin.tier()
+                if tier != want_tier:
+                    continue
+                if want_tier == 30:
+                    if coin.entries_primary >= MAX_ENTRIES_PER_TIER:
+                        continue
+                elif want_tier == 20:
+                    if coin.entries_probe >= MAX_ENTRIES_PER_TIER:
+                        continue
+                else:
+                    if coin.entries_filler >= MAX_ENTRIES_PER_TIER:
+                        continue
+                cap = state.max_buy_lamports(mint)
+                if cap < MIN_BUY:
+                    continue
+                amount = size
+                if amount > cap:
+                    amount = cap
+                if free < amount + tx:
+                    continue
+                orders.append({
+                    "side": "buy", "mint": mint, "quote_lamports": amount,
+                    "max_slippage_bps": MAX_SLIPPAGE_BPS,
+                })
+                free -= amount + tx
+                slots_open -= 1
+                if want_tier == 30:
+                    coin.entries_primary += 1
+                elif want_tier == 20:
+                    coin.entries_probe += 1
+                else:
+                    coin.entries_filler += 1
         return orders
-
-    def _qualifies(self, coin, probe):
-        """True when the coin's early flow passes the quality bars."""
-        if probe:
-            max_trades = PROBE_MAX_EARLY_TRADES
-            min_buy = PROBE_MIN_EARLY_BUY_SOL
-            ratio_num = PROBE_MIN_BUY_SELL_NUM
-            ratio_den = PROBE_MIN_BUY_SELL_DEN
-            min_buyers = PROBE_MIN_BUYERS
-            max_share_bps = PROBE_MAX_TOP_BUYER_SHARE_BPS
-            cb_min = PROBE_CREATOR_BUY_MIN
-            cb_max = PROBE_CREATOR_BUY_MAX
-        else:
-            max_trades = MAX_EARLY_TRADES
-            min_buy = MIN_EARLY_BUY_SOL
-            ratio_num = MIN_BUY_SELL_NUM
-            ratio_den = MIN_BUY_SELL_DEN
-            min_buyers = MIN_BUYERS
-            max_share_bps = MAX_TOP_BUYER_SHARE_BPS
-            cb_min = CREATOR_BUY_MIN
-            cb_max = CREATOR_BUY_MAX
-        if coin.trade_count > max_trades:
-            return False
-        if coin.cum_buy_sol < min_buy:
-            return False
-        if coin.cum_buy_sol * ratio_den < coin.cum_sell_sol * ratio_num:
-            return False
-        if len(coin.buyers) < min_buyers:
-            return False
-        if coin.top_buyer_share_bps() > max_share_bps:
-            return False
-        if coin.creator_buy_sol < cb_min or coin.creator_buy_sol > cb_max:
-            return False
-        if coin.creator_sold:
-            return False
-        return True
 
 
 def main():
